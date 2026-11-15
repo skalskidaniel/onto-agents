@@ -2,7 +2,7 @@
 
 A multi-agent ontology generator built with LangGraph. It generates an OWL ontology from **competency questions (CQs)** and measures it against an
 **Ontogenia-style single-pass baseline** using alignment-based metrics on the
-[llm4ke](https://github.com/D2KLab/llm4ke) dataset (`data/`: 10 ontologies, 831 CQs).
+[llm4ke](https://github.com/D2KLab/llm4ke) dataset.
 
 The feedback signal is **executable validation**, not LLM self-critique alone:
 
@@ -20,7 +20,7 @@ CQs ──► Planner ──► Generator ──► merge ──► CQ→SPARQL 
 ## Install
 
 ```bash
-uv sync                      # Python 3.14, dev tools included
+uv sync
 uv run pre-commit install    # ruff, ruff-format, ty, import-linter
 uv sync --group notebooks    # pandas/matplotlib for notebooks/data_analysis.ipynb
 ```
@@ -39,7 +39,7 @@ uv run pytest                                                    # 89 tests, no 
 A real run:
 
 ```bash
-# Option A: Claude Code CLI (no API key needed if `claude` is logged in)
+# Option A: Claude Code CLI
 uv run ontoagents run --config experiments/configs/agents-full.yaml --ontology awo
 # Option B: LangChain provider
 uv sync --extra anthropic && export ANTHROPIC_API_KEY=...
@@ -68,30 +68,7 @@ LLM responses are cached on disk (`.cache/llm`, keyed by transcript, model and s
 
 CLI overrides: `--ontology X` (repeatable), `--system agents|ontogenia`, `--provider`, `--model`, `--max-cqs N` (evenly spaced, deterministic subset), `--workers N` (ontologies run in parallel processes), `--name`, `--results-dir`.
 
-## Package layout
-
-```
-src/ontoagents/
-  domain/      CompetencyQuestion, CQBatch, OntologyDraft (canonical Turtle text), Signature,
-               OntologyDiff, ValidationReport/PipelineReport, DesignPattern, Usage,
-               OntologyGenerator Protocol + GenerationInputs/Result, SPARQL conventions
-  data/        YamlCQLoader (stable IDs, drops `rq`), OntologyCatalog, ReferenceOntology (eval only)
-  llm/         LLMClient Protocol, LangChainClient, ClaudeCodeClient, CachingLLMClient,
-               FakeLLMClient (scripted), HeuristicLLMClient (offline dry runs)
-  patterns/    PatternRepository ABC, StaticPatternRepository (10 content ODPs, keyword retrieval)
-  agents/      GeneratorAgent, CQToSparqlAgent, CriticRepairAgent, GroupPlanner, LLMPlanner,
-               prompts/*.j2
-  validation/  SyntaxValidator, ConsistencyValidator (owlready2+HermiT), CQCoverageValidator,
-               RegressionValidator, ValidatorPipeline
-  graph/       GraphState (TypedDict + reducers), BudgetPolicy, pure routing, OntologyGraphBuilder,
-               AgentSystem (implements OntologyGenerator)
-  baselines/   OntogeniaBaseline (implements OntologyGenerator)
-  evaluation/  LexicalAligner (Hungarian), Metric classes, ExperimentRunner, Markdown report
-  config.py    Experiment/LLM/System/Evaluation configs (YAML)
-  cli.py       composition root: the only place concrete classes are wired together
-```
-
-### Design rules (enforced)
+### Design rules
 
 - **Leakage boundary.** Inside the loop, the only visible inputs are the CQs and, when `use_description: true`, `description.txt`.
   - `CompetencyQuestion` has no field for gold SPARQL (`extra="forbid"`).
@@ -104,9 +81,42 @@ src/ontoagents/
   - the generation side (`agents`, `graph`, `validation`, `llm`, `patterns`) must not import `evaluation`, `baselines` or `data.reference`;
   - `baselines` must not import `evaluation` or `data.reference`.
 - **Dependency injection.** Agents receive their LLM client, renderer, validators and pattern repository through their constructors. The graph is wiring only; node logic lives in `GraphNodes`, and routing functions are pure `(state, policy) -> next`.
-- **Serialisable state.** `GraphState` holds plain JSON values: Turtle strings, dicts and counters. It never holds an `rdflib.Graph`, so LangGraph checkpointing works.
+- **Serializable state.** `GraphState` holds plain JSON values: Turtle strings, dicts and counters. It never holds an `rdflib.Graph`, so LangGraph checkpointing works.
 
 ## The loop
+
+The diagram mirrors the LangGraph nodes in `graph/builder.py` (`plan`, `select`, `generate`, `merge`, `translate`, `validate`, `repair`, `commit`, `rollback`, `stop`) and the routers in `graph/routing.py`.
+
+```mermaid
+flowchart TD
+    START([CQs]) --> plan["<b>plan</b><br/>Planner: CQs → ordered batches"]
+    plan --> select{{"<b>select</b><br/>next batch"}}
+
+    select -->|"no batches left,<br/>after one retry round<br/>for failed CQs"| END([Final ontology + trace])
+    select -->|budget exhausted| stop["<b>stop</b><br/>set stop_reason"] --> END
+    select -->|batch available| generate
+
+    generate["<b>generate</b><br/>Generator: Turtle fragment<br/>(committed signature + batch + ODPs + feedback)"]
+    generate --> merge["<b>merge</b><br/>committed draft + fragment = candidate"]
+    merge -->|"fragment does not parse"| validate
+    merge -->|"translator enabled"| translate["<b>translate</b><br/>Translator: one SPARQL per CQ<br/>(candidate signature only)"]
+    merge -->|"translator ablated"| validate
+    translate --> validate
+
+    subgraph pipeline ["validate: deterministic, cheapest first, stops at the first failure"]
+        direction LR
+        v1["syntax<br/>rdflib parse + allowed IRIs"] --> v2["consistency<br/>HermiT"] --> v3["cq_coverage<br/>structural SPARQL check"] --> v4["regression<br/>cached SPARQL of earlier CQs"]
+    end
+    validate["<b>validate</b>"] --- pipeline
+
+    validate -->|green| commit["<b>commit</b><br/>candidate becomes the draft;<br/>cache the batch's SPARQL"]
+    validate -->|"red and<br/>repairs &lt; max_repair<br/>and budget left"| repair["<b>repair</b><br/>Critic: numbered fix instructions<br/>(or raw report when ablated)"]
+    validate -->|"red and<br/>no repairs/budget left"| rollback["<b>rollback</b><br/>discard candidate,<br/>mark batch failed"]
+
+    repair -->|"repair_count + 1"| generate
+    commit --> select
+    rollback --> select
+```
 
 1. **Planning.**
    - `GroupPlanner` (deterministic) keeps dataset order, never mixes CQ `group`s, and chunks into batches of `batch_size`.

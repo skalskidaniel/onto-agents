@@ -95,11 +95,11 @@ def build_langchain_client(
     """Instantiate a provider chat model (requires the matching optional extra)."""
     chat_model: BaseChatModel
     if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic  # ty: ignore[import-not-found]
+        from langchain_anthropic import ChatAnthropic
 
         chat_model = ChatAnthropic(model=model, max_tokens=max_tokens or 8192)  # type: ignore[call-arg]
     elif provider == "openai":
-        from langchain_openai import ChatOpenAI  # ty: ignore[import-not-found]
+        from langchain_openai import ChatOpenAI
 
         chat_model = ChatOpenAI(model=model)
     else:
